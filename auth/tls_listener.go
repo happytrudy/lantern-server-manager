@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"path"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/registration"
 	"github.com/mroth/jitter"
 )
@@ -66,7 +68,7 @@ func (u *legoUser) GetEmail() string                        { return u.Email }
 func (u *legoUser) GetRegistration() *registration.Resource { return u.Registration }
 func (u *legoUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
 
-func loadCert(dataDir, certPEMFile, keyPEMFile string, publicIP string) (*tls.Certificate, error) {
+func loadCert(dataDir, certPEMFile, keyPEMFile, domain, cloudflareAPIToken, publicIP string) (*tls.Certificate, error) {
 	// If custom cert/key files are provided, use those directly
 	if certPEMFile != "" && keyPEMFile != "" {
 		log.Debug("Loading custom TLS certificate. Skipping ACME", "cert", certPEMFile, "key", keyPEMFile)
@@ -80,6 +82,20 @@ func loadCert(dataDir, certPEMFile, keyPEMFile string, publicIP string) (*tls.Ce
 		}
 		c, err := tls.X509KeyPair(certPEM, keyPEM)
 		return &c, err
+	}
+
+	if (certPEMFile == "") != (keyPEMFile == "") {
+		return nil, fmt.Errorf("--cert and --key must be provided together")
+	}
+	if domain != "" {
+		publicIP = domain
+	}
+
+	// ACME HTTP-01 certificates cannot be issued for bare IP addresses.
+	// Require an explicit certificate/key pair for IP-based deployments so
+	// IPv4 and IPv6 manager URLs do not trigger a doomed ACME request.
+	if addr, err := netip.ParseAddr(publicIP); err == nil {
+		return nil, fmt.Errorf("automatic ACME certificates are not available for IP address %s; provide --cert and --key (or use a DNS name)", addr.String())
 	}
 
 	// Try to load existing ACME certificate
@@ -158,12 +174,27 @@ func loadCert(dataDir, certPEMFile, keyPEMFile string, publicIP string) (*tls.Ce
 		return nil, fmt.Errorf("failed to create ACME client: %w", err)
 	}
 
-	common.OpenFirewallPort(80)
-	defer common.CloseFirewallPort(80)
-	// Use HTTP-01 challenge on port 80
-	err = client.Challenge.SetHTTP01Provider(http01.NewProviderServer("", "80"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to set HTTP challenge provider: %w", err)
+	if cloudflareAPIToken != "" {
+		if domain == "" {
+			return nil, fmt.Errorf("--cloudflare-api-token requires --domain")
+		}
+		if err := os.Setenv(cloudflare.EnvDNSAPIToken, cloudflareAPIToken); err != nil {
+			return nil, fmt.Errorf("failed to configure Cloudflare API token: %w", err)
+		}
+		provider, err := cloudflare.NewDNSProvider()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Cloudflare DNS provider: %w", err)
+		}
+		if err = client.Challenge.SetDNS01Provider(provider); err != nil {
+			return nil, fmt.Errorf("failed to set DNS-01 provider: %w", err)
+		}
+	} else {
+		common.OpenFirewallPort(80)
+		defer common.CloseFirewallPort(80)
+		err = client.Challenge.SetHTTP01Provider(http01.NewProviderServer("", "80"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to set HTTP challenge provider: %w", err)
+		}
 	}
 
 	// 4. Register if needed
@@ -216,12 +247,17 @@ func loadCert(dataDir, certPEMFile, keyPEMFile string, publicIP string) (*tls.Ce
 	return &c, nil
 }
 
-func ListenAndServeTLS(dataDir, certPEM, keyPEM string, publicIP string, listenPort int, handler http.Handler) error {
-	c, err := loadCert(dataDir, certPEM, keyPEM, publicIP)
+func ListenAndServeTLS(dataDir, certPEM, keyPEM, domain, cloudflareAPIToken, publicIP string, listenPort int, startBackend func() error, handler http.Handler) error {
+	c, err := loadCert(dataDir, certPEM, keyPEM, domain, cloudflareAPIToken, publicIP)
 	if err != nil {
 		log.Fatal(err)
 	}
 	cert.Store(c)
+	if startBackend != nil {
+		if err := startBackend(); err != nil {
+			return fmt.Errorf("failed to start sing-box after certificate setup: %w", err)
+		}
+	}
 
 	conf := &tls.Config{
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -231,18 +267,18 @@ func ListenAndServeTLS(dataDir, certPEM, keyPEM string, publicIP string, listenP
 	}
 
 	go CheckConnectivity(publicIP, listenPort)
-	go keepCertificateFresh(dataDir, certPEM, keyPEM, publicIP)
+	go keepCertificateFresh(dataDir, certPEM, keyPEM, domain, cloudflareAPIToken, publicIP)
 	addr := fmt.Sprintf(":%d", listenPort)
 	server := &http.Server{Addr: addr, Handler: handler, TLSConfig: conf}
 	return server.ListenAndServeTLS("", "")
 }
 
-func keepCertificateFresh(dataDir, certPEM, keyPEM string, publicIP string) {
+func keepCertificateFresh(dataDir, certPEM, keyPEM, domain, cloudflareAPIToken, publicIP string) {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for {
 		<-ticker.C
-		c, err := loadCert(dataDir, certPEM, keyPEM, publicIP)
+		c, err := loadCert(dataDir, certPEM, keyPEM, domain, cloudflareAPIToken, publicIP)
 		if err != nil {
 			log.Error("Failed to renew certificate", "error", err)
 			continue

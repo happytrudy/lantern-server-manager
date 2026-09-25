@@ -10,7 +10,7 @@ import (
 	"path"
 
 	"github.com/charmbracelet/log"
-	box "github.com/getlantern/lantern-box"
+	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	singJson "github.com/sagernet/sing/common/json"
@@ -27,7 +27,7 @@ func ReadSingBoxServerConfig(dataDir string) (*option.Options, error) {
 	if err != nil {
 		return nil, err
 	}
-	globalCtx := box.BaseContext()
+	globalCtx := libbox.BaseContext(nil)
 
 	opt, err := singJson.UnmarshalExtendedContext[option.Options](globalCtx, data)
 	if err != nil {
@@ -36,124 +36,200 @@ func ReadSingBoxServerConfig(dataDir string) (*option.Options, error) {
 	return &opt, nil
 }
 
-// RevokeUser removes a user from the sing-box Shadowsocks inbound configuration.
-// It reads the current config, finds the user by name in the first inbound's user list,
-// removes them, writes the updated config back, and restarts the sing-box service.
+// RevokeUser removes a named user from every user-based inbound. Inbounds that
+// do not support named users are left unchanged.
 func RevokeUser(dataDir, username string) error {
-	singBoxServerConfig, err := ReadSingBoxServerConfig(dataDir)
+	cfg, err := ReadSingBoxServerConfig(dataDir)
 	if err != nil {
 		return err
 	}
-	if len(singBoxServerConfig.Inbounds) == 0 {
-		return fmt.Errorf("no inbounds found, invalid config")
-	}
-	inboundOptions, ok := singBoxServerConfig.Inbounds[0].Options.(*option.ShadowsocksInboundOptions)
-	if !ok {
-		return fmt.Errorf("inbound is not shadowsocks")
-	}
-	for i, u := range inboundOptions.Users {
-		if u.Name == username {
-			inboundOptions.Users = append(inboundOptions.Users[:i], inboundOptions.Users[i+1:]...)
-			break
-		}
-	}
-	if err = WriteSingBoxServerConfig(dataDir, singBoxServerConfig); err != nil {
-		return err
-	}
-
-	// restart singbox
-	return RestartSingBox(dataDir)
-}
-
-// GetShadowsocksInboundConfig extracts the Shadowsocks inbound options from a given
-// sing-box configuration. It assumes the first inbound defined in the config
-// is the relevant Shadowsocks inbound.
-func GetShadowsocksInboundConfig(singBoxServerConfig *option.Options) (*option.ShadowsocksInboundOptions, error) {
-	if len(singBoxServerConfig.Inbounds) == 0 {
-		return nil, fmt.Errorf("no inbounds found, invalid config")
-	}
-	inboundOptions, ok := singBoxServerConfig.Inbounds[0].Options.(*option.ShadowsocksInboundOptions)
-	if !ok {
-		return nil, fmt.Errorf("inbound is not shadowsocks")
-	}
-	return inboundOptions, nil
-}
-
-// GenerateSingBoxConnectConfig creates a sing-box client configuration JSON for a specific user.
-// It reads the server's sing-box config, finds or creates the user's Shadowsocks credentials,
-// constructs a client config pointing to the server's public IP and Shadowsocks port,
-// and returns the marshalled JSON configuration. If the user doesn't exist, they are added
-// to the server config, and sing-box is restarted.
-func GenerateSingBoxConnectConfig(dataDir, publicIP, username string) ([]byte, error) {
-	singBoxServerConfig, err := ReadSingBoxServerConfig(dataDir)
-	if err != nil {
-		return nil, err
-	}
-	inboundOptions, err := GetShadowsocksInboundConfig(singBoxServerConfig)
-	if err != nil {
-		return nil, err
-	}
-	var pw string
-	if username == "admin" {
-		pw = inboundOptions.Password
-	} else {
-		for _, u := range inboundOptions.Users {
-			if u.Name == username {
-				pw = u.Password
-				break
+	changed := false
+	for i := range cfg.Inbounds {
+		switch in := cfg.Inbounds[i].Options.(type) {
+		case *option.ShadowsocksInboundOptions:
+			for j, u := range in.Users {
+				if u.Name == username {
+					in.Users = append(in.Users[:j], in.Users[j+1:]...)
+					changed = true
+					break
+				}
+			}
+		case *option.VLESSInboundOptions:
+			for j, u := range in.Users {
+				if u.Name == username {
+					in.Users = append(in.Users[:j], in.Users[j+1:]...)
+					changed = true
+					break
+				}
+			}
+		case *option.VMessInboundOptions:
+			for j, u := range in.Users {
+				if u.Name == username {
+					in.Users = append(in.Users[:j], in.Users[j+1:]...)
+					changed = true
+					break
+				}
+			}
+		case *option.TrojanInboundOptions:
+			for j, u := range in.Users {
+				if u.Name == username {
+					in.Users = append(in.Users[:j], in.Users[j+1:]...)
+					changed = true
+					break
+				}
+			}
+		case *option.Hysteria2InboundOptions:
+			for j, u := range in.Users {
+				if u.Name == username {
+					in.Users = append(in.Users[:j], in.Users[j+1:]...)
+					changed = true
+					break
+				}
 			}
 		}
 	}
-	if pw == "" {
-		pw = makeShadowsocksPassword()
-		inboundOptions.Users = append(inboundOptions.Users, option.ShadowsocksUser{
-			Name:     username,
-			Password: pw,
-		})
-		// user now found. add the user
-		if err = WriteSingBoxServerConfig(dataDir, singBoxServerConfig); err != nil {
-			return nil, err
-		}
-		// restart singbox
-		if err = RestartSingBox(dataDir); err != nil {
-			return nil, err
+	if !changed {
+		return nil
+	}
+	if err = WriteSingBoxServerConfig(dataDir, cfg); err != nil {
+		return err
+	}
+	return RestartSingBox(dataDir)
+}
+
+// firstUsableInbound returns the first inbound that can be represented as a
+// client outbound. This avoids assuming that Shadowsocks is inbound zero.
+func firstUsableInbound(cfg *option.Options) (*option.Inbound, error) {
+	for i := range cfg.Inbounds {
+		in := &cfg.Inbounds[i]
+		switch in.Options.(type) {
+		case *option.ShadowsocksInboundOptions, *option.VLESSInboundOptions,
+			*option.VMessInboundOptions, *option.TrojanInboundOptions,
+			*option.Hysteria2InboundOptions:
+			return in, nil
 		}
 	}
-	opt := option.Options{
-		Log: &option.LogOptions{
-			Level:  "debug",
-			Output: "stdout",
-		},
-		// the block below is only used for testing, when Lantern VPN imports the config
-		// it should discard the Inbounds section and replace it with the one in the app (TUN)
-		Inbounds: []option.Inbound{
-			{
-				Type: "socks5",
-				Options: &option.SocksInboundOptions{
-					ListenOptions: option.ListenOptions{
-						ListenPort: 8888,
-						Listen:     common.Ptr(badoption.Addr(netip.AddrFrom4([4]byte{127, 0, 0, 1}))),
-					},
-				},
-			},
-		},
-		Outbounds: []option.Outbound{
-			{
-				Type: "shadowsocks",
-				Tag:  "ss-outbound",
-				Options: &option.ShadowsocksOutboundOptions{
-					DialerOptions: option.DialerOptions{},
-					ServerOptions: option.ServerOptions{
-						Server:     publicIP,
-						ServerPort: inboundOptions.ListenPort,
-					},
-					Method:   "chacha20-ietf-poly1305",
-					Password: pw,
-				},
-			},
-		},
+	return nil, fmt.Errorf("no supported inbound found")
+}
+
+// GetShadowsocksInboundConfig is retained for initialization/firewall callers.
+func GetShadowsocksInboundConfig(cfg *option.Options) (*option.ShadowsocksInboundOptions, error) {
+	for i := range cfg.Inbounds {
+		if in, ok := cfg.Inbounds[i].Options.(*option.ShadowsocksInboundOptions); ok {
+			return in, nil
+		}
 	}
+	return nil, fmt.Errorf("no shadowsocks inbound found")
+}
+
+// GenerateSingBoxConnectConfig copies the selected server inbound into a
+// client outbound. Protocol-specific options (TLS, transport, Reality, etc.)
+// are preserved, while the listen address is replaced with the public server
+// address. Shadowsocks keeps its per-user password behavior.
+func GenerateSingBoxConnectConfig(dataDir, publicIP, username string) ([]byte, error) {
+	cfg, err := ReadSingBoxServerConfig(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	in, err := firstUsableInbound(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var outbound option.Outbound
+	switch inOpts := in.Options.(type) {
+	case *option.ShadowsocksInboundOptions:
+		pw := inOpts.Password
+		if username != "admin" {
+			for _, u := range inOpts.Users {
+				if u.Name == username {
+					pw = u.Password
+					break
+				}
+			}
+			if pw == inOpts.Password {
+				pw = makeShadowsocksPassword()
+				inOpts.Users = append(inOpts.Users, option.ShadowsocksUser{Name: username, Password: pw})
+				if err = WriteSingBoxServerConfig(dataDir, cfg); err != nil {
+					return nil, err
+				}
+				if err = RestartSingBox(dataDir); err != nil {
+					return nil, err
+				}
+			}
+		}
+		outbound = option.Outbound{Type: "shadowsocks", Tag: "server-outbound", Options: &option.ShadowsocksOutboundOptions{ServerOptions: option.ServerOptions{Server: publicIP, ServerPort: inOpts.ListenPort}, Method: inOpts.Method, Password: pw}}
+	case *option.VLESSInboundOptions:
+		if len(inOpts.Users) == 0 {
+			return nil, fmt.Errorf("vless inbound has no users")
+		}
+		u := inOpts.Users[0]
+		for _, candidate := range inOpts.Users {
+			if candidate.Name == username {
+				u = candidate
+				break
+			}
+		}
+		outbound = option.Outbound{Type: "vless", Tag: "server-outbound", Options: &option.VLESSOutboundOptions{ServerOptions: option.ServerOptions{Server: publicIP, ServerPort: inOpts.ListenPort}, UUID: u.UUID, Flow: u.Flow, OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: inboundTLSOptions(inOpts.TLS)}, Transport: inOpts.Transport}}
+	case *option.VMessInboundOptions:
+		if len(inOpts.Users) == 0 {
+			return nil, fmt.Errorf("vmess inbound has no users")
+		}
+		u := inOpts.Users[0]
+		for _, candidate := range inOpts.Users {
+			if candidate.Name == username {
+				u = candidate
+				break
+			}
+		}
+		outbound = option.Outbound{Type: "vmess", Tag: "server-outbound", Options: &option.VMessOutboundOptions{ServerOptions: option.ServerOptions{Server: publicIP, ServerPort: inOpts.ListenPort}, UUID: u.UUID, AlterId: u.AlterId, Security: "auto", OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: inboundTLSOptions(inOpts.TLS)}, Transport: inOpts.Transport}}
+	case *option.TrojanInboundOptions:
+		if len(inOpts.Users) == 0 {
+			return nil, fmt.Errorf("trojan inbound has no users")
+		}
+		u := inOpts.Users[0]
+		for _, candidate := range inOpts.Users {
+			if candidate.Name == username {
+				u = candidate
+				break
+			}
+		}
+		outbound = option.Outbound{Type: "trojan", Tag: "server-outbound", Options: &option.TrojanOutboundOptions{ServerOptions: option.ServerOptions{Server: publicIP, ServerPort: inOpts.ListenPort}, Password: u.Password, OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: inboundTLSOptions(inOpts.TLS)}, Transport: inOpts.Transport}}
+	case *option.Hysteria2InboundOptions:
+		if len(inOpts.Users) == 0 {
+			return nil, fmt.Errorf("hysteria2 inbound has no users")
+		}
+		u := inOpts.Users[0]
+		for _, candidate := range inOpts.Users {
+			if candidate.Name == username {
+				u = candidate
+				break
+			}
+		}
+		outbound = option.Outbound{Type: "hysteria2", Tag: "server-outbound", Options: &option.Hysteria2OutboundOptions{ServerOptions: option.ServerOptions{Server: publicIP, ServerPort: inOpts.ListenPort}, UpMbps: inOpts.UpMbps, DownMbps: inOpts.DownMbps, Obfs: inOpts.Obfs, Password: u.Password, OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: inboundTLSOptions(inOpts.TLS)}}}
+	default:
+		return nil, fmt.Errorf("unsupported inbound type %q", in.Type)
+	}
+	opt := option.Options{Log: &option.LogOptions{Level: "debug", Output: "stdout"}, Inbounds: []option.Inbound{{Type: "socks5", Options: &option.SocksInboundOptions{ListenOptions: option.ListenOptions{ListenPort: 8888, Listen: common.Ptr(badoption.Addr(netip.AddrFrom4([4]byte{127, 0, 0, 1})))}}}}, Outbounds: []option.Outbound{outbound}}
 	return badjson.MarshallObjects(opt)
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func inboundTLSOptions(in *option.InboundTLSOptions) *option.OutboundTLSOptions {
+	if in == nil {
+		return nil
+	}
+	return &option.OutboundTLSOptions{Enabled: in.Enabled, ServerName: in.ServerName, Insecure: in.Insecure, ALPN: in.ALPN, MinVersion: in.MinVersion, MaxVersion: in.MaxVersion, Reality: func() *option.OutboundRealityOptions {
+		if in.Reality == nil {
+			return nil
+		}
+		return &option.OutboundRealityOptions{Enabled: true, ShortID: firstString(in.Reality.ShortID)}
+	}()}
 }
 
 // WriteSingBoxServerConfig marshals the provided sing-box options into JSON

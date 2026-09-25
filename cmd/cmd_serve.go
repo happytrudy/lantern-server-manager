@@ -18,13 +18,15 @@ type ServeCmd struct {
 	serverConfig  *ServerConfig
 	singboxConfig *option.Options
 
-	CertPEM string `arg:"--cert" help:"TLS certificate file" default:""`
-	KeyPEM  string `arg:"--key" help:"TLS key file" default:""`
+	CertPEM            string `arg:"--cert" help:"TLS certificate file" default:""`
+	KeyPEM             string `arg:"--key" help:"TLS key file" default:""`
+	Domain             string `arg:"--domain" help:"ACME certificate domain" default:""`
+	CloudflareAPIToken string `arg:"--cloudflare-api-token" help:"Cloudflare DNS API token for DNS-01 ACME" default:""`
 }
 
 // readConfigs loads the server and sing-box configurations from the data directory.
 // If the server configuration doesn't exist, it initializes both configurations.
-// It validates the loaded or initialized sing-box config and restarts the sing-box service.
+// It loads the server and sing-box configurations. Certificate setup and sing-box validation/startup are ordered in Run.
 func (c *ServeCmd) readConfigs() error {
 	var err error
 	c.serverConfig, err = ReadServerConfig(args.DataDir)
@@ -40,14 +42,6 @@ func (c *ServeCmd) readConfigs() error {
 			return fmt.Errorf("failed to read sing-box config: %w", err)
 		}
 	}
-	if err = common.ValidateSingBoxConfig(args.DataDir); err != nil {
-		return fmt.Errorf("failed to validate sing-box config: %w", err)
-	}
-
-	if err = common.RestartSingBox(args.DataDir); err != nil {
-		return fmt.Errorf("failed to start sing-box: %w", err)
-	}
-
 	return nil
 }
 
@@ -80,7 +74,12 @@ func (c *ServeCmd) Run() error {
 		_, _ = fmt.Fprintf(w, "Welcome to Lantern Server Manager. In future, there will be UI here!")
 	})
 
-	return auth.ListenAndServeTLS(args.DataDir, c.CertPEM, c.KeyPEM, c.serverConfig.ExternalIP, c.serverConfig.Port, srv)
+	return auth.ListenAndServeTLS(args.DataDir, c.CertPEM, c.KeyPEM, c.Domain, c.CloudflareAPIToken, c.serverConfig.ExternalIP, c.serverConfig.Port, func() error {
+		if err := common.ValidateSingBoxConfig(args.DataDir); err != nil {
+			return fmt.Errorf("failed to validate sing-box config: %w", err)
+		}
+		return common.RestartSingBox(args.DataDir)
+	}, srv)
 }
 
 // getConnectConfigHandler handles requests for generating sing-box client configurations.

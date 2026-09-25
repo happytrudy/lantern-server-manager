@@ -105,3 +105,9 @@ ssh ec2-user@xxxxxxxx sudo journalctl -u lantern-server-manager
 - It's the only key that can be used to manage the server.
 - It's stored in the server's config file and on the phone that scanned the initial QR
 - If that key is lost, the server can no longer be managed and the only way to regain access is to delete the config file and start over.
+
+## Custom sing-box protocols
+
+The manager reads `sing-box-config.json` and generates the Lantern client configuration from the first supported inbound (`shadowsocks`, `vless`, `vmess`, `trojan`, or `hysteria2`). The protocol-specific TLS, Reality, transport, QUIC, and authentication settings are preserved. You can replace the generated Shadowsocks inbound with one of these protocols, then restart the manager; do not replace the API `server.json` or access token.
+
+For a custom protocol, make sure the inbound has at least one user where the protocol requires users, and open both the API port and the inbound `listen_port` in the cloud firewall/security group. The APK connects through `/api/v1/connect-config`; it does not connect directly to the server manager API port as a proxy.
